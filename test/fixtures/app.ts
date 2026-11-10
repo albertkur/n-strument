@@ -52,7 +52,8 @@ await (metrics.getMeterProvider() as MeterProvider).forceFlush();
 
 // Covers delivery to the asynchronous GC observer, and the 5+ samples runtime-node needs before it reports
 // event-loop delay.
-await delay(300);
+// FIXTURE_WAIT_MS lets a test keep the app alive across several export intervals.
+await delay(Number(process.env.FIXTURE_WAIT_MS ?? 300));
 
 server.closeAllConnections();
 await new Promise<void>((resolve) => server.close(() => resolve()));

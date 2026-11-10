@@ -50,7 +50,7 @@ processed.add(1, { "order.type": "standard" });   // keep attribute values low-c
 
 ### Graceful shutdown
 
-Spans are buffered in memory by a `BatchSpanProcessor` and flushed periodically, and metrics are only exported every 60 seconds. On process exit neither is drained automatically, so the telemetry around a deploy, scale-down, or shutdown — often the ones you most want — can be lost. n-strument does **not** register its own `SIGTERM`/`SIGINT` handlers (that would race with, and prematurely exit out of, your service's shutdown). Instead it exports `shutdownTelemetry`, which you call as the **last** step of your own graceful-shutdown sequence — after you've stopped accepting work and finished in-flight requests, so their spans are captured:
+Spans are buffered in memory by a `BatchSpanProcessor` and flushed periodically, and metrics are only exported once per interval (60 seconds unless `OTEL_METRIC_EXPORT_INTERVAL` says otherwise). On process exit neither is drained automatically, so the telemetry around a deploy, scale-down, or shutdown — often the ones you most want — can be lost. n-strument does **not** register its own `SIGTERM`/`SIGINT` handlers (that would race with, and prematurely exit out of, your service's shutdown). Instead it exports `shutdownTelemetry`, which you call as the **last** step of your own graceful-shutdown sequence — after you've stopped accepting work and finished in-flight requests, so their spans are captured:
 
 ```ts
 import { shutdownTelemetry } from "@nivinjoseph/n-strument";
@@ -82,6 +82,13 @@ All settings are read through [`@nivinjoseph/n-config`](https://www.npmjs.com/pa
 
 > ⚠️ If `env` is not set, importing the module throws immediately:
 > `ApplicationException: Required config 'env' not found`.
+
+Two standard OpenTelemetry environment variables tune metrics. They're read straight from the environment, not through n-config:
+
+| Environment variable                                | Default      | Purpose |
+| --------------------------------------------------- | ------------ | ------- |
+| `OTEL_METRIC_EXPORT_INTERVAL`                       | `60000`      | How often metrics are pushed, in milliseconds. Also how often gauges are read. A value that isn't a number is ignored with a warning. |
+| `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | `cumulative` | `cumulative` or `delta` (any case). Keep cumulative for Prometheus (e.g. Grafana LGTM), which only stores cumulative and drops delta batches whole. Set `delta` for the Datadog Agent, so no series loses its first point (see [Metrics](#metrics)). |
 
 ## Backend / infrastructure
 
@@ -122,7 +129,7 @@ n-strument always registers the global meter provider, so your custom metrics (s
 
   Everything else the instrumentations record is dropped, using metric views: every enabled instrumentation other than runtime-node, pg and http is dropped whole, and those three have their other metrics dropped by name — `nonDevDroppedMetrics` in [`src/index.ts`](src/index.ts). Enabling another instrumentation keeps its metrics out automatically, but a metric that an OpenTelemetry upgrade adds to runtime-node, pg or http is exported until it's added to that list.
 
-Metrics are pushed every 60 seconds and on `shutdownTelemetry()`. They're sent with cumulative temporality (each push carries running totals), which Prometheus (e.g. Grafana LGTM) requires and the Datadog Agent accepts — the Agent turns them into deltas itself, dropping the first point after each process start. Counters and histograms lose nothing between pushes — each push carries everything recorded since the last one — but a gauge is only read at each push, so a value that rises and falls between two pushes isn't seen. On AWS Lambda, the aws-lambda instrumentation also flushes spans and metrics at the end of every invocation, since a frozen function would otherwise never send them, and the invocation doesn't return until that export finishes. So a Lambda that preloads n-strument needs a collector it can reach (an ADOT layer or the Datadog extension): with none, every invocation spends about 8 seconds retrying the export before it returns, which is longer than Lambda's default 3-second timeout, so with default settings every invocation times out.
+Metrics are pushed every 60 seconds (`OTEL_METRIC_EXPORT_INTERVAL`) and on `shutdownTelemetry()`. By default they're sent with cumulative temporality (each push carries running totals), which Prometheus (e.g. Grafana LGTM) requires. A counter or histogram series only comes into existence on its first recording, and its first point already holds everything recorded so far, so neither backend shows that first interval: Prometheus's `rate()` and `increase()` need an earlier sample to compare against, so a burst that creates a series shows as flat, though the counter's raw value is correct; and the Datadog Agent, which turns cumulative into deltas itself, drops each new series' first point. That happens for every new combination of attribute values the first time it occurs after a process start, not only once per process. Setting `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE=delta` avoids it in Datadog, since each delta point is complete on its own. Counters and histograms lose nothing between pushes — each push carries everything recorded since the last one — but a gauge is only read at each push, so a value that rises and falls between two pushes isn't seen. On AWS Lambda, the aws-lambda instrumentation also flushes spans and metrics at the end of every invocation, since a frozen function would otherwise never send them, and the invocation doesn't return until that export finishes. So a Lambda that preloads n-strument needs a collector it can reach (an ADOT layer or the Datadog extension): with none, every invocation spends about 8 seconds retrying the export before it returns, which is longer than Lambda's default 3-second timeout, so with default settings every invocation times out.
 
 Series carry no per-process attribute — only `service.name` and `service.version` — so they assume each process reports through its own collector or Agent, such as a Datadog Agent sidecar per task. Processes of one service that share an Agent, or concurrent instances of one Lambda, send the same series, and their cumulative totals collide.
 

@@ -138,6 +138,7 @@ function attributeKeysOf(metric: OtlpMetric | undefined): Set<string>
     return new Set((metric?.histogram?.dataPoints ?? []).flatMap(t => t.attributes ?? []).map(t => t.key));
 }
 
+const otlpDelta = 1;
 const otlpCumulative = 2;
 
 
@@ -233,5 +234,23 @@ await describe("telemetry", async () =>
 
         assert.ok(run.incomingHeaders["x-amzn-trace-id"] != null);
         assert.strictEqual(run.incomingHeaders["traceparent"], undefined);
+    });
+
+    await test("honours OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE", async () =>
+    {
+        const run = await runFixture({ env: "prod", OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: "delta" });
+
+        const metrics = metricsByName(run);
+        assert.strictEqual(temporalityOf(metrics.get("smoke.events")), otlpDelta);
+        assert.strictEqual(temporalityOf(metrics.get("http.server.duration")), otlpDelta);
+    });
+
+    await test("honours OTEL_METRIC_EXPORT_INTERVAL", async () =>
+    {
+        // Alive for 2.5s with a 1s interval: two periodic pushes, plus the one on shutdown.
+        const run = await runFixture({ env: "prod", OTEL_METRIC_EXPORT_INTERVAL: "1000", FIXTURE_WAIT_MS: "2500" });
+
+        const pushes = run.requests.filter(t => t.path === "/v1/metrics").length;
+        assert.ok(pushes >= 3, `expected at least 3 metric pushes, got ${pushes}`);
     });
 });

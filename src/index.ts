@@ -1,7 +1,7 @@
 import { getNodeAutoInstrumentations, InstrumentationConfigMap } from "@opentelemetry/auto-instrumentations-node";
 import { registerInstrumentations } from "@opentelemetry/instrumentation";
 import { context, diag, DiagConsoleLogger, DiagLogLevel, metrics } from "@opentelemetry/api";
-import { isTracingSuppressed } from "@opentelemetry/core";
+import { getNumberFromEnv, isTracingSuppressed } from "@opentelemetry/core";
 import { KoaLayerType } from "@opentelemetry/instrumentation-koa";
 import { defaultResource, resourceFromAttributes } from "@opentelemetry/resources";
 import
@@ -168,9 +168,14 @@ const tracerProvider = new NodeTracerProvider({
 
 tracerProvider.register(enableXrayTracing ? { propagator: new AWSXRayPropagator() } : undefined);
 
-// No temporality is set, so the exporter's default applies: cumulative. Prometheus (e.g. Grafana LGTM in dev) only
-// stores cumulative, and the Datadog agent accepts it, turning it into deltas itself (it drops the first point after
-// each process start, having nothing to subtract it from).
+// How often metrics are pushed, in milliseconds: the standard OTEL_METRIC_EXPORT_INTERVAL, which the SDK's reader
+// doesn't read on its own (only NodeSDK does), else its 60s default.
+const metricsExportIntervalMs = getNumberFromEnv("OTEL_METRIC_EXPORT_INTERVAL") ?? 60_000;
+
+// No temporality is set here, so the exporter reads the standard OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+// itself, defaulting to cumulative. Prometheus (e.g. Grafana LGTM in dev) only stores cumulative. The Datadog agent
+// accepts it, turning it into deltas itself, but drops each new series' first point, having nothing to subtract it
+// from; set delta for Datadog to keep those.
 const metricExporter = new OTLPMetricExporter({
     url: `${collectorUrl}/v1/metrics`
 });
@@ -208,9 +213,14 @@ if (!isDev)
 const meterProvider = new MeterProvider({
     resource,
     views,
-    // The SDK's default interval: a push every 60s. Counters and histograms lose nothing between pushes; a gauge is
-    // read only at each push.
-    readers: [new PeriodicExportingMetricReader({ exporter: metricExporter })]
+    // Counters and histograms lose nothing between pushes; a gauge is read only at each push.
+    readers: [new PeriodicExportingMetricReader({
+        exporter: metricExporter,
+        exportIntervalMillis: metricsExportIntervalMs,
+        // The SDK's 30s default, unless the interval is shorter: given only a shorter interval, the reader clamps the
+        // timeout itself but logs that it did at every startup.
+        exportTimeoutMillis: Math.min(metricsExportIntervalMs, 30_000)
+    })]
 });
 
 // @opentelemetry/api has no proxy for metrics: a meter obtained before a provider is registered stays a no-op
