@@ -87,7 +87,7 @@ Two standard OpenTelemetry environment variables tune metrics. They're read stra
 
 | Environment variable                                | Default      | Purpose |
 | --------------------------------------------------- | ------------ | ------- |
-| `OTEL_METRIC_EXPORT_INTERVAL`                       | `60000`      | How often metrics are pushed, in milliseconds. Also how often gauges are read. A value that isn't a number is ignored with a warning. |
+| `OTEL_METRIC_EXPORT_INTERVAL`                       | `60000`      | How often metrics are pushed, in milliseconds. Also how often gauges are read. A value that isn't a number from 1 to 2147483647 is ignored with a warning. |
 | `OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE` | `cumulative` | `cumulative` or `delta` (any case). Keep cumulative for Prometheus (e.g. Grafana LGTM), which only stores cumulative and drops delta batches whole. Set `delta` for the Datadog Agent, so no series loses its first point (see [Metrics](#metrics)). |
 
 ## Backend / infrastructure
@@ -125,7 +125,7 @@ n-strument always registers the global meter provider, so your custom metrics (s
 - **Everywhere else**, only your custom metrics plus these, because a backend like Datadog bills every metric series and already derives most request metrics from traces:
   - `nodejs.eventloop.delay.p99`, `nodejs.eventloop.utilization` — event-loop health
   - `db.client.connection.count`, `db.client.connection.pending_requests` — pg pool saturation
-  - `http.server.duration`, tagged only with `http.method`, `http.route` and `http.status_code`. Unlike trace-derived request metrics, it stays correct when `otelTraceSamplingRate` is below 1. With `OTEL_SEMCONV_STABILITY_OPT_IN=http` it's exported under its stable name, `http.server.request.duration`, tagged only with `http.request.method`, `http.route` and `http.response.status_code`. With `http/dup`, both are exported, so every request series is paid for twice.
+  - `http.server.duration`, tagged only with `http.method`, `http.route` and `http.status_code`. Unlike trace-derived request metrics, it stays correct when `otelTraceSamplingRate` is below 1. With `OTEL_SEMCONV_STABILITY_OPT_IN=http` it's exported under its stable name, `http.server.request.duration`, tagged only with `http.request.method`, `http.route`, `http.response.status_code` and, for a request that failed before it had a status code, `error.type`. With `http/dup`, both are exported, so every request series is paid for twice.
 
   Everything else the instrumentations record is dropped, using metric views: every enabled instrumentation other than runtime-node, pg and http is dropped whole, and those three have their other metrics dropped by name — `nonDevDroppedMetrics` in [`src/index.ts`](src/index.ts). Enabling another instrumentation keeps its metrics out automatically, but a metric that an OpenTelemetry upgrade adds to runtime-node, pg or http is exported until it's added to that list.
 

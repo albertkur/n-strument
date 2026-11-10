@@ -1,7 +1,7 @@
 import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
 import { registerInstrumentations } from "@opentelemetry/instrumentation";
 import { context, diag, DiagConsoleLogger, DiagLogLevel, metrics } from "@opentelemetry/api";
-import { isTracingSuppressed } from "@opentelemetry/core";
+import { getNumberFromEnv, isTracingSuppressed } from "@opentelemetry/core";
 import { KoaLayerType } from "@opentelemetry/instrumentation-koa";
 import { defaultResource, resourceFromAttributes } from "@opentelemetry/resources";
 import { 
@@ -28,8 +28,9 @@ const isDev = env === "dev";
 const samplingRate = TypeHelper.parseNumber(ConfigurationManager.getConfig("otelTraceSamplingRate")) ?? 1;
 const enableXrayTracing = TypeHelper.parseBoolean(ConfigurationManager.getConfig("enableXrayTracing")) ?? false;
 // The OTLP collector, for traces and metrics alike (the key predates both metrics and the port): "host" or
-// "host:port", the port defaulting to OTLP/HTTP's 4318. An IPv6 address needs brackets ("[::1]:4318").
-const collector = new URL(`http://${getStringConfig("otelTraceHost", isDev ? "localhost" : "0.0.0.0")}`);
+// "host:port", the port defaulting to OTLP/HTTP's 4318. An IPv6 address needs brackets ("[::1]:4318"). Parsed under
+// a scheme of its own, since http's would blank an explicit ":80" as its default.
+const collector = new URL(`otlp://${getStringConfig("otelTraceHost", isDev ? "localhost" : "0.0.0.0")}`);
 const collectorUrl = `http://${collector.hostname}:${collector.port || "4318"}`;
 // Every key in the InstrumentationConfigMap is listed explicitly with an `enabled` flag. The
 // config object is an *override map*, not an allow-list: any instrumentation left out (or set to
@@ -63,8 +64,9 @@ const instrumentationConfig = {
     "@opentelemetry/instrumentation-host-metrics": { enabled: false },
     "@opentelemetry/instrumentation-http": {
         enabled: true,
-        // The OTLP exporters' own requests to the collector. Both exporters send with tracing suppressed, so no
-        // span is made, but the client duration metric would still record every export.
+        // Every request made with tracing suppressed: in practice the OTLP exporters' own requests to the collector,
+        // plus anything app code wraps in suppressTracing. Both exporters send with tracing suppressed, so no span is
+        // made, but the client duration metric would still record every export.
         ignoreOutgoingRequestHook: () => isTracingSuppressed(context.active())
     },
     "@opentelemetry/instrumentation-ioredis": { enabled: false }, // we don't want low-level ioredis command spans; the EDA flow is already traced via n-eda's event.* publish/process messaging spans
@@ -138,9 +140,23 @@ const tracerProvider = new NodeTracerProvider({
     spanProcessors: [new BatchSpanProcessor(traceExporter)]
 });
 tracerProvider.register(enableXrayTracing ? { propagator: new AWSXRayPropagator() } : undefined);
-// No temporality is set, so the exporter's default applies: cumulative. Prometheus (e.g. Grafana LGTM in dev) only
-// stores cumulative, and the Datadog agent accepts it, turning it into deltas itself (it drops the first point after
-// each process start, having nothing to subtract it from).
+// Milliseconds from a standard OTel env var, or undefined (with a warning) when it isn't a positive number Node can
+// hold as a timer: past 2^31-1, setInterval fires every millisecond instead. getNumberFromEnv already warns about
+// and leaves out a value that isn't a number.
+function getMillisFromEnv(key) {
+    const value = getNumberFromEnv(key);
+    if (value == null || (value > 0 && value <= 2_147_483_647))
+        return value;
+    diag.warn(`${key} (${value}) is invalid, expected milliseconds from 1 to 2147483647, using default.`);
+    return undefined;
+}
+// How often metrics are pushed, in milliseconds: the standard OTEL_METRIC_EXPORT_INTERVAL, which the SDK's reader
+// doesn't read on its own (only NodeSDK does), else its 60s default.
+const metricsExportIntervalMs = getMillisFromEnv("OTEL_METRIC_EXPORT_INTERVAL") ?? 60_000;
+// No temporality is set here, so the exporter reads the standard OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
+// itself, defaulting to cumulative. Prometheus (e.g. Grafana LGTM in dev) only stores cumulative. The Datadog agent
+// accepts it, turning it into deltas itself, but drops each new series' first point, having nothing to subtract it
+// from; set delta for Datadog to keep those.
 const metricExporter = new OTLPMetricExporter({
     url: `${collectorUrl}/v1/metrics`
 });
@@ -156,7 +172,8 @@ if (!isDev) {
         for (const instrumentName of instrumentNames)
             views.push({ meterName, instrumentName, aggregation: { type: AggregationType.DROP } });
     // Keep the request metric's tags to bounded ones; old semconv also tags it with the client-supplied Host
-    // header (net.host.name), and Datadog bills every tag combination. Same tags under the stable names.
+    // header (net.host.name), and Datadog bills every tag combination. Same tags under the stable names, plus
+    // error.type, which marks a request that failed before it had a status code.
     views.push({
         meterName: "@opentelemetry/instrumentation-http",
         instrumentName: "http.server.duration",
@@ -165,16 +182,20 @@ if (!isDev) {
         meterName: "@opentelemetry/instrumentation-http",
         instrumentName: "http.server.request.duration",
         attributesProcessors: [
-            createAllowListAttributesProcessor(["http.request.method", "http.route", "http.response.status_code"])
+            createAllowListAttributesProcessor([
+                "http.request.method", "http.route", "http.response.status_code", "error.type"
+            ])
         ]
     });
 }
 const meterProvider = new MeterProvider({
     resource,
     views,
-    // The SDK's default interval: a push every 60s. Counters and histograms lose nothing between pushes; a gauge is
-    // read only at each push.
-    readers: [new PeriodicExportingMetricReader({ exporter: metricExporter })]
+    // Counters and histograms lose nothing between pushes; a gauge is read only at each push.
+    readers: [new PeriodicExportingMetricReader({
+            exporter: metricExporter,
+            exportIntervalMillis: metricsExportIntervalMs
+        })]
 });
 // @opentelemetry/api has no proxy for metrics: a meter obtained before a provider is registered stays a no-op
 // forever. Registering here, at preload and ahead of any app code, is what lets app and library code (e.g.

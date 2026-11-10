@@ -42,8 +42,9 @@ const samplingRate = TypeHelper.parseNumber(ConfigurationManager.getConfig("otel
 const enableXrayTracing = TypeHelper.parseBoolean(ConfigurationManager.getConfig("enableXrayTracing")) ?? false;
 
 // The OTLP collector, for traces and metrics alike (the key predates both metrics and the port): "host" or
-// "host:port", the port defaulting to OTLP/HTTP's 4318. An IPv6 address needs brackets ("[::1]:4318").
-const collector = new URL(`http://${getStringConfig("otelTraceHost", isDev ? "localhost" : "0.0.0.0")}`);
+// "host:port", the port defaulting to OTLP/HTTP's 4318. An IPv6 address needs brackets ("[::1]:4318"). Parsed under
+// a scheme of its own, since http's would blank an explicit ":80" as its default.
+const collector = new URL(`otlp://${getStringConfig("otelTraceHost", isDev ? "localhost" : "0.0.0.0")}`);
 const collectorUrl = `http://${collector.hostname}:${collector.port || "4318"}`;
 
 
@@ -79,8 +80,9 @@ const instrumentationConfig: Required<InstrumentationConfigMap> = {
     "@opentelemetry/instrumentation-host-metrics": { enabled: false },
     "@opentelemetry/instrumentation-http": {
         enabled: true,
-        // The OTLP exporters' own requests to the collector. Both exporters send with tracing suppressed, so no
-        // span is made, but the client duration metric would still record every export.
+        // Every request made with tracing suppressed: in practice the OTLP exporters' own requests to the collector,
+        // plus anything app code wraps in suppressTracing. Both exporters send with tracing suppressed, so no span is
+        // made, but the client duration metric would still record every export.
         ignoreOutgoingRequestHook: () => isTracingSuppressed(context.active())
     },
     "@opentelemetry/instrumentation-ioredis": { enabled: false }, // we don't want low-level ioredis command spans; the EDA flow is already traced via n-eda's event.* publish/process messaging spans
@@ -168,9 +170,22 @@ const tracerProvider = new NodeTracerProvider({
 
 tracerProvider.register(enableXrayTracing ? { propagator: new AWSXRayPropagator() } : undefined);
 
+// Milliseconds from a standard OTel env var, or undefined (with a warning) when it isn't a positive number Node can
+// hold as a timer: past 2^31-1, setInterval fires every millisecond instead. getNumberFromEnv already warns about
+// and leaves out a value that isn't a number.
+function getMillisFromEnv(key: string): number | undefined
+{
+    const value = getNumberFromEnv(key);
+    if (value == null || (value > 0 && value <= 2_147_483_647))
+        return value;
+
+    diag.warn(`${key} (${value}) is invalid, expected milliseconds from 1 to 2147483647, using default.`);
+    return undefined;
+}
+
 // How often metrics are pushed, in milliseconds: the standard OTEL_METRIC_EXPORT_INTERVAL, which the SDK's reader
 // doesn't read on its own (only NodeSDK does), else its 60s default.
-const metricsExportIntervalMs = getNumberFromEnv("OTEL_METRIC_EXPORT_INTERVAL") ?? 60_000;
+const metricsExportIntervalMs = getMillisFromEnv("OTEL_METRIC_EXPORT_INTERVAL") ?? 60_000;
 
 // No temporality is set here, so the exporter reads the standard OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE
 // itself, defaulting to cumulative. Prometheus (e.g. Grafana LGTM in dev) only stores cumulative. The Datadog agent
@@ -196,7 +211,8 @@ if (!isDev)
             views.push({ meterName, instrumentName, aggregation: { type: AggregationType.DROP } });
 
     // Keep the request metric's tags to bounded ones; old semconv also tags it with the client-supplied Host
-    // header (net.host.name), and Datadog bills every tag combination. Same tags under the stable names.
+    // header (net.host.name), and Datadog bills every tag combination. Same tags under the stable names, plus
+    // error.type, which marks a request that failed before it had a status code.
     views.push({
         meterName: "@opentelemetry/instrumentation-http",
         instrumentName: "http.server.duration",
@@ -205,7 +221,9 @@ if (!isDev)
         meterName: "@opentelemetry/instrumentation-http",
         instrumentName: "http.server.request.duration",
         attributesProcessors: [
-            createAllowListAttributesProcessor(["http.request.method", "http.route", "http.response.status_code"])
+            createAllowListAttributesProcessor([
+                "http.request.method", "http.route", "http.response.status_code", "error.type"
+            ])
         ]
     });
 }
@@ -216,10 +234,7 @@ const meterProvider = new MeterProvider({
     // Counters and histograms lose nothing between pushes; a gauge is read only at each push.
     readers: [new PeriodicExportingMetricReader({
         exporter: metricExporter,
-        exportIntervalMillis: metricsExportIntervalMs,
-        // The SDK's 30s default, unless the interval is shorter: given only a shorter interval, the reader clamps the
-        // timeout itself but logs that it did at every startup.
-        exportTimeoutMillis: Math.min(metricsExportIntervalMs, 30_000)
+        exportIntervalMillis: metricsExportIntervalMs
     })]
 });
 

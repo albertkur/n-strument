@@ -46,6 +46,7 @@ interface RunResult
 {
     requests: Array<OtlpRequest>;
     incomingHeaders: Record<string, string | Array<string> | undefined>;
+    stderr: string;
 }
 
 const srcIndexUrl = new URL("../src/index.js", import.meta.url);
@@ -98,8 +99,14 @@ async function runFixture(config: Record<string, string>): Promise<RunResult>
 
     return {
         requests: [...received],
-        incomingHeaders: (JSON.parse(headersLine) as Pick<RunResult, "incomingHeaders">).incomingHeaders
+        incomingHeaders: (JSON.parse(headersLine) as Pick<RunResult, "incomingHeaders">).incomingHeaders,
+        stderr
     };
+}
+
+function metricPushes(run: RunResult): number
+{
+    return run.requests.filter(t => t.path === "/v1/metrics").length;
 }
 
 function paths(run: RunResult): Set<string>
@@ -204,7 +211,7 @@ await describe("telemetry", async () =>
         const httpAttributeKeys = attributeKeysOf(metrics.get("http.server.request.duration"));
         assert.ok(httpAttributeKeys.has("http.request.method") && httpAttributeKeys.has("http.response.status_code"));
         for (const key of httpAttributeKeys)
-            assert.ok(["http.request.method", "http.route", "http.response.status_code"].includes(key),
+            assert.ok(["http.request.method", "http.route", "http.response.status_code", "error.type"].includes(key),
                 `unexpected http.server.request.duration attribute '${key}'`);
     });
 
@@ -250,7 +257,21 @@ await describe("telemetry", async () =>
         // Alive for 2.5s with a 1s interval: two periodic pushes, plus the one on shutdown.
         const run = await runFixture({ env: "prod", OTEL_METRIC_EXPORT_INTERVAL: "1000", FIXTURE_WAIT_MS: "2500" });
 
-        const pushes = run.requests.filter(t => t.path === "/v1/metrics").length;
+        const pushes = metricPushes(run);
         assert.ok(pushes >= 3, `expected at least 3 metric pushes, got ${pushes}`);
+    });
+
+    await test("ignores, with a warning, an OTEL_METRIC_EXPORT_INTERVAL that isn't 1 to 2^31-1 milliseconds", async () =>
+    {
+        // At or below 0 the reader throws at import; past 2^31-1 Node fires the timer every millisecond.
+        for (const value of ["0", "-1", "Infinity", "3000000000"])
+        {
+            const run = await runFixture({ env: "prod", OTEL_METRIC_EXPORT_INTERVAL: value });
+
+            assert.ok(run.stderr.includes("OTEL_METRIC_EXPORT_INTERVAL"), `no warning for ${value}\n${run.stderr}`);
+            // Only the fixture's forced export and the one on shutdown, at the 60s default.
+            const pushes = metricPushes(run);
+            assert.ok(pushes <= 3, `expected at most 3 metric pushes for ${value}, got ${pushes}`);
+        }
     });
 });
