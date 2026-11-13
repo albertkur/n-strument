@@ -180,28 +180,6 @@ await describe("telemetry", async () =>
         const metrics = metricsByName(run);
         assert.deepStrictEqual([...metrics.keys()].sort(), [
             "db.client.connection.count",
-            "http.server.duration",
-            "nodejs.eventloop.delay.p99",
-            "nodejs.eventloop.utilization",
-            "smoke.events"
-        ]);
-
-        const httpAttributeKeys = attributeKeysOf(metrics.get("http.server.duration"));
-        assert.ok(httpAttributeKeys.has("http.method") && httpAttributeKeys.has("http.status_code"));
-        for (const key of httpAttributeKeys)
-            assert.ok(["http.method", "http.route", "http.status_code"].includes(key), `unexpected http.server.duration attribute '${key}'`);
-
-        assert.strictEqual(temporalityOf(metrics.get("smoke.events")), otlpCumulative);
-        assert.strictEqual(temporalityOf(metrics.get("http.server.duration")), otlpCumulative);
-    });
-
-    await test("outside dev, with stable HTTP semconv, keeps the request metric under its stable name only", async () =>
-    {
-        const run = await runFixture({ env: "prod", OTEL_SEMCONV_STABILITY_OPT_IN: "http" });
-
-        const metrics = metricsByName(run);
-        assert.deepStrictEqual([...metrics.keys()].sort(), [
-            "db.client.connection.count",
             "http.server.request.duration",
             "nodejs.eventloop.delay.p99",
             "nodejs.eventloop.utilization",
@@ -213,6 +191,9 @@ await describe("telemetry", async () =>
         for (const key of httpAttributeKeys)
             assert.ok(["http.request.method", "http.route", "http.response.status_code", "error.type"].includes(key),
                 `unexpected http.server.request.duration attribute '${key}'`);
+
+        assert.strictEqual(temporalityOf(metrics.get("smoke.events")), otlpCumulative);
+        assert.strictEqual(temporalityOf(metrics.get("http.server.request.duration")), otlpCumulative);
     });
 
     await test("in dev, exports the full automatic set, as cumulative", async () =>
@@ -222,17 +203,17 @@ await describe("telemetry", async () =>
         assert.ok(!paths(run).has("/v1/logs"));
 
         const metrics = metricsByName(run);
-        for (const name of ["smoke.events", "http.server.duration", "http.client.duration", "v8js.gc.duration", "nodejs.eventloop.utilization",
-            "db.client.operation.duration", "messaging.client.sent.messages"])
+        for (const name of ["smoke.events", "http.server.request.duration", "http.client.request.duration", "v8js.gc.duration",
+            "nodejs.eventloop.utilization", "db.client.operation.duration", "messaging.client.sent.messages"])
             assert.ok(metrics.has(name), `missing ${name}; got ${[...metrics.keys()].join(", ")}`);
 
-        for (const name of ["smoke.events", "http.server.duration", "http.client.duration", "v8js.gc.duration"])
+        for (const name of ["smoke.events", "http.server.request.duration", "http.client.request.duration", "v8js.gc.duration"])
             assert.strictEqual(temporalityOf(metrics.get(name)), otlpCumulative, `${name} should be cumulative`);
 
         // Only the fixture's own request: the export it forces ahead of shutdown would add a second data point (the
         // receiver's port) if the exporters' requests were recorded.
-        assert.strictEqual(metrics.get("http.client.duration")?.histogram?.dataPoints.length, 1,
-            "http.client.duration should not record the exporters' requests");
+        assert.strictEqual(metrics.get("http.client.request.duration")?.histogram?.dataPoints.length, 1,
+            "http.client.request.duration should not record the exporters' requests");
     });
 
     await test("with X-Ray on, propagates X-Amzn-Trace-Id instead of traceparent", async () =>
@@ -249,7 +230,7 @@ await describe("telemetry", async () =>
 
         const metrics = metricsByName(run);
         assert.strictEqual(temporalityOf(metrics.get("smoke.events")), otlpDelta);
-        assert.strictEqual(temporalityOf(metrics.get("http.server.duration")), otlpDelta);
+        assert.strictEqual(temporalityOf(metrics.get("http.server.request.duration")), otlpDelta);
     });
 
     await test("honours OTEL_METRIC_EXPORT_INTERVAL", async () =>

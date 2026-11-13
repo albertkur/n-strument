@@ -1,14 +1,14 @@
 import { getNodeAutoInstrumentations } from "@opentelemetry/auto-instrumentations-node";
 import { registerInstrumentations } from "@opentelemetry/instrumentation";
-import { context, diag, DiagConsoleLogger, DiagLogLevel, metrics } from "@opentelemetry/api";
-import { getNumberFromEnv, isTracingSuppressed } from "@opentelemetry/core";
+import { context, diag, DiagConsoleLogger, DiagLogLevel, metrics, propagation, trace } from "@opentelemetry/api";
+import { AsyncLocalStorageContextManager } from "@opentelemetry/context-async-hooks";
+import { CompositePropagator, getNumberFromEnv, isTracingSuppressed, W3CBaggagePropagator, W3CTraceContextPropagator } from "@opentelemetry/core";
 import { KoaLayerType } from "@opentelemetry/instrumentation-koa";
 import { defaultResource, resourceFromAttributes } from "@opentelemetry/resources";
 import { 
 // SemanticResourceAttributes,
 ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
-import { NodeTracerProvider, ParentBasedSampler, TraceIdRatioBasedSampler } from "@opentelemetry/sdk-trace-node";
-import { BatchSpanProcessor } from "@opentelemetry/sdk-trace-base";
+import { BatchSpanProcessor, ParentBasedSampler, TraceIdRatioBasedSampler, TracerProvider } from "@opentelemetry/sdk-trace";
 import { AggregationType, createAllowListAttributesProcessor, MeterProvider, PeriodicExportingMetricReader } from "@opentelemetry/sdk-metrics";
 import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-http";
 import { OTLPMetricExporter } from "@opentelemetry/exporter-metrics-otlp-http";
@@ -108,11 +108,10 @@ const nonDevDroppedMetrics = {
         "nodejs.eventloop.delay.stddev", "nodejs.eventloop.delay.p50", "nodejs.eventloop.delay.p90",
         "nodejs.eventloop.time", "v8js.*"
     ],
-    // keeps db.client.connection.count and db.client.connection.pending_requests
+    // keeps db.client.connection.count, db.client.connection.max and db.client.connection.pending_requests
     "@opentelemetry/instrumentation-pg": ["db.client.operation.duration"],
-    // keeps http.server.duration, or under OTEL_SEMCONV_STABILITY_OPT_IN=http its stable name
-    // http.server.request.duration; the client metric is listed under both names
-    "@opentelemetry/instrumentation-http": ["http.client.duration", "http.client.request.duration"]
+    // keeps http.server.request.duration
+    "@opentelemetry/instrumentation-http": ["http.client.request.duration"]
 };
 const resource = defaultResource().merge(resourceFromAttributes({
     // [SemanticResourceAttributes.SERVICE_NAME]: ConfigurationManager.getConfig("package.name"),
@@ -135,11 +134,20 @@ const traceExporter = new OTLPTraceExporter({
     headers: {}
 });
 // Span processors are now supplied via the constructor (addSpanProcessor was removed in the OTel SDK 2.x line).
-const tracerProvider = new NodeTracerProvider({
+// The SDK no longer reads the OTEL_BSP_* env vars, so the batch processor runs on its defaults: a 5s delay, batches of
+// 512 and a queue of 2048.
+const tracerProvider = new TracerProvider({
     ...tracerConfig,
-    spanProcessors: [new BatchSpanProcessor(traceExporter)]
+    spanProcessors: [new BatchSpanProcessor({ exporter: traceExporter })]
 });
-tracerProvider.register(enableXrayTracing ? { propagator: new AWSXRayPropagator() } : undefined);
+// What NodeTracerProvider.register() did before SDK 3.x removed it: make the provider global, track the active span
+// across async calls (without a context manager, spans started in a callback or after an await lose their parent),
+// and set the propagator — X-Ray's when enabled, else register()'s default of W3C trace context plus baggage.
+trace.setGlobalTracerProvider(tracerProvider);
+context.setGlobalContextManager(new AsyncLocalStorageContextManager().enable());
+propagation.setGlobalPropagator(enableXrayTracing
+    ? new AWSXRayPropagator()
+    : new CompositePropagator({ propagators: [new W3CTraceContextPropagator(), new W3CBaggagePropagator()] }));
 // Milliseconds from a standard OTel env var, or undefined (with a warning) when it isn't a positive number Node can
 // hold as a timer: past 2^31-1, setInterval fires every millisecond instead. getNumberFromEnv already warns about
 // and leaves out a value that isn't a number.
@@ -171,14 +179,10 @@ if (!isDev) {
     for (const [meterName, instrumentNames] of Object.entries(nonDevDroppedMetrics))
         for (const instrumentName of instrumentNames)
             views.push({ meterName, instrumentName, aggregation: { type: AggregationType.DROP } });
-    // Keep the request metric's tags to bounded ones; old semconv also tags it with the client-supplied Host
-    // header (net.host.name), and Datadog bills every tag combination. Same tags under the stable names, plus
-    // error.type, which marks a request that failed before it had a status code.
+    // Keep the request metric's tags to method, route and status, plus error.type, which marks a request that failed
+    // before it had a status code; Datadog bills every tag combination. This leaves out url.scheme and
+    // network.protocol.version, and any tag a later version of the instrumentation adds.
     views.push({
-        meterName: "@opentelemetry/instrumentation-http",
-        instrumentName: "http.server.duration",
-        attributesProcessors: [createAllowListAttributesProcessor(["http.method", "http.route", "http.status_code"])]
-    }, {
         meterName: "@opentelemetry/instrumentation-http",
         instrumentName: "http.server.request.duration",
         attributesProcessors: [

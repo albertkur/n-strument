@@ -118,14 +118,14 @@ n-strument always registers the global meter provider, so your custom metrics (s
 
 - **In dev (`env` is `"dev"`)**, everything the enabled instrumentations record — for local dashboards:
   - Node runtime: event-loop delay, utilization and time (`nodejs.eventloop.*`), GC duration and heap (`v8js.*`)
-  - HTTP: `http.server.duration`, `http.client.duration`
-  - PostgreSQL: `db.client.operation.duration`, `db.client.connection.count`, `db.client.connection.pending_requests`
+  - HTTP: `http.server.request.duration`, `http.client.request.duration`
+  - PostgreSQL: `db.client.operation.duration`, `db.client.connection.count`, `db.client.connection.max`, `db.client.connection.pending_requests`
   - Kafka: `messaging.*`
   - AWS SDK (Bedrock only): `gen_ai.*`
 - **Everywhere else**, only your custom metrics plus these, because a backend like Datadog bills every metric series and already derives most request metrics from traces:
   - `nodejs.eventloop.delay.p99`, `nodejs.eventloop.utilization` — event-loop health
-  - `db.client.connection.count`, `db.client.connection.pending_requests` — pg pool saturation
-  - `http.server.duration`, tagged only with `http.method`, `http.route` and `http.status_code`. Unlike trace-derived request metrics, it stays correct when `otelTraceSamplingRate` is below 1. With `OTEL_SEMCONV_STABILITY_OPT_IN=http` it's exported under its stable name, `http.server.request.duration`, tagged only with `http.request.method`, `http.route`, `http.response.status_code` and, for a request that failed before it had a status code, `error.type`. With `http/dup`, both are exported, so every request series is paid for twice.
+  - `db.client.connection.count`, `db.client.connection.max`, `db.client.connection.pending_requests` — pg pool saturation
+  - `http.server.request.duration`, in seconds, tagged only with `http.request.method`, `http.route`, `http.response.status_code` and, for a request that failed before it had a status code, `error.type`. Unlike trace-derived request metrics, it stays correct when `otelTraceSamplingRate` is below 1. It replaces `http.server.duration` (in milliseconds, tagged `http.method`, `http.route` and `http.status_code`), which the HTTP instrumentation no longer records; `OTEL_SEMCONV_STABILITY_OPT_IN` no longer changes what it records.
 
   Everything else the instrumentations record is dropped, using metric views: every enabled instrumentation other than runtime-node, pg and http is dropped whole, and those three have their other metrics dropped by name — `nonDevDroppedMetrics` in [`src/index.ts`](src/index.ts). Enabling another instrumentation keeps its metrics out automatically, but a metric that an OpenTelemetry upgrade adds to runtime-node, pg or http is exported until it's added to that list.
 
